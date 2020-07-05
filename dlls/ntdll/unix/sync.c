@@ -1811,32 +1811,23 @@ NTSTATUS CDECL fast_RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
 NTSTATUS CDECL fast_RtlTryAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 {
     int old, new, *futex;
-    NTSTATUS ret;
 
     if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
 
     if (!(futex = get_futex( &lock->Ptr )))
         return STATUS_NOT_IMPLEMENTED;
 
-    do
+    old = *futex;
+
+    /* We can only lock when no bits are set */
+    if (0 == old)
     {
-        old = *futex;
+        new = SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT;
+        if (InterlockedCompareExchange( futex, new, old ) == old)
+            return STATUS_SUCCESS;
+    }
 
-        if (!(old & SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT)
-                && !(old & SRWLOCK_FUTEX_SHARED_OWNERS_MASK))
-        {
-            /* Not locked exclusive or shared. We can try to grab it. */
-            new = old | SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT;
-            ret = STATUS_SUCCESS;
-        }
-        else
-        {
-            new = old;
-            ret = STATUS_TIMEOUT;
-        }
-    } while (InterlockedCompareExchange( futex, new, old ) != old);
-
-    return ret;
+    return STATUS_TIMEOUT;
 }
 
 NTSTATUS CDECL fast_RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
@@ -1848,6 +1839,13 @@ NTSTATUS CDECL fast_RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 
     if (!(futex = get_futex( &lock->Ptr )))
         return STATUS_NOT_IMPLEMENTED;
+
+    old = *futex;
+    if (0 == old) {
+        new = SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT;
+        if (InterlockedCompareExchange( futex, new, old ) == old)
+		return STATUS_SUCCESS;
+    }
 
     /* Atomically increment the exclusive waiter count. */
     do
@@ -1891,7 +1889,6 @@ NTSTATUS CDECL fast_RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 NTSTATUS CDECL fast_RtlTryAcquireSRWLockShared( RTL_SRWLOCK *lock )
 {
     int new, old, *futex;
-    NTSTATUS ret;
 
     if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
 
@@ -1909,16 +1906,14 @@ NTSTATUS CDECL fast_RtlTryAcquireSRWLockShared( RTL_SRWLOCK *lock )
              * grab it. */
             new = old + SRWLOCK_FUTEX_SHARED_OWNERS_INC;
             assert(new & SRWLOCK_FUTEX_SHARED_OWNERS_MASK);
-            ret = STATUS_SUCCESS;
         }
         else
         {
-            new = old;
-            ret = STATUS_TIMEOUT;
+            return STATUS_TIMEOUT;
         }
     } while (InterlockedCompareExchange( futex, new, old ) != old);
 
-    return ret;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS CDECL fast_RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
