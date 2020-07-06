@@ -1859,12 +1859,9 @@ static NTSTATUS fast_acquire_srw_exclusive( RTL_SRWLOCK *lock )
     }
 
     /* Atomically increment the exclusive waiter count. */
-    do
-    {
-        old = *futex;
-        new = old + SRWLOCK_FUTEX_EXCLUSIVE_WAITERS_INC;
-        assert(new & SRWLOCK_FUTEX_EXCLUSIVE_WAITERS_MASK);
-    } while (interlocked_cmpxchg( futex, new, old ) != old);
+    old = interlocked_xchg_add( futex, SRWLOCK_FUTEX_EXCLUSIVE_WAITERS_INC );
+    assert((old & SRWLOCK_FUTEX_EXCLUSIVE_WAITERS_MASK)
+           != SRWLOCK_FUTEX_EXCLUSIVE_WAITERS_MASK);
 
     for (;;)
     {
