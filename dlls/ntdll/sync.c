@@ -72,8 +72,6 @@ static const LARGE_INTEGER zero_timeout;
 
 #define TICKSPERSEC 10000000
 
-#ifdef __linux__
-
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
 #define FUTEX_WAIT_BITSET 9
@@ -101,24 +99,7 @@ static inline int futex_wake_bitset( const int *addr, int val, int mask )
     return syscall( __NR_futex, addr, FUTEX_WAKE_BITSET | futex_private, val, NULL, 0, mask );
 }
 
-static inline int use_futexes(void)
-{
-    static int supported = -1;
-
-    if (supported == -1)
-    {
-        futex_wait( &supported, 10, NULL );
-        if (errno == ENOSYS)
-        {
-            futex_private = 0;
-            futex_wait( &supported, 10, NULL );
-        }
-        supported = (errno != ENOSYS);
-    }
-    return supported;
-}
-
-static int *get_futex(void **ptr)
+static inline int *get_futex(void **ptr)
 {
     if (sizeof(void *) == 8)
         return (int *)((((ULONG_PTR)ptr) + 3) & ~3);
@@ -144,7 +125,6 @@ static void timespec_from_timeout( struct timespec *timespec, const LARGE_INTEGE
     timespec->tv_sec  = diff / TICKSPERSEC;
     timespec->tv_nsec = (diff % TICKSPERSEC) * 100;
 }
-#endif
 
 /* creates a struct security_descriptor and contained information in one contiguous piece of memory */
 NTSTATUS alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
@@ -1789,8 +1769,6 @@ DWORD WINAPI RtlRunOnceExecuteOnce( RTL_RUN_ONCE *once, PRTL_RUN_ONCE_INIT_FN fu
     return RtlRunOnceComplete( once, 0, context ? *context : NULL );
 }
 
-#ifdef __linux__
-
 /* Futex-based SRW lock implementation:
  *
  * Since we can rely on the kernel to release all threads and don't need to
@@ -1820,42 +1798,41 @@ DWORD WINAPI RtlRunOnceExecuteOnce( RTL_RUN_ONCE *once, PRTL_RUN_ONCE_INIT_FN fu
 #define SRWLOCK_FUTEX_BITSET_EXCLUSIVE  1
 #define SRWLOCK_FUTEX_BITSET_SHARED     2
 
-static NTSTATUS fast_try_acquire_srw_exclusive( RTL_SRWLOCK *lock )
+/***********************************************************************
+ *              RtlInitializeSRWLock (NTDLL.@)
+ *
+ * NOTES
+ *  Please note that SRWLocks do not keep track of the owner of a lock.
+ *  It doesn't make any difference which thread for example unlocks an
+ *  SRWLock (see corresponding tests). This implementation uses two
+ *  keyed events (one for the exclusive waiters and one for the shared
+ *  waiters) and is limited to 2^15-1 waiting threads.
+ */
+void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
 {
-    int old, new, *futex;
-
-    if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
-
-    if (!(futex = get_futex( &lock->Ptr )))
-        return STATUS_NOT_IMPLEMENTED;
-    old = *futex;
-
-    /* We can only lock when no bits are set */
-    if (0 == old)
-    {
-        new = SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT;
-        if (interlocked_cmpxchg( futex, new, old ) == old)
-            return STATUS_SUCCESS;
-    }
-
-    return STATUS_TIMEOUT;
+    lock->Ptr = NULL;
 }
 
-static NTSTATUS fast_acquire_srw_exclusive( RTL_SRWLOCK *lock )
+/***********************************************************************
+ *              RtlAcquireSRWLockExclusive (NTDLL.@)
+ *
+ * NOTES
+ *  Unlike RtlAcquireResourceExclusive this function doesn't allow
+ *  nested calls from the same thread. "Upgrading" a shared access lock
+ *  to an exclusive access lock also doesn't seem to be supported.
+ */
+void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 {
     int old, new, *futex;
     BOOLEAN wait;
 
-    if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
-
-    if (!(futex = get_futex( &lock->Ptr )))
-        return STATUS_NOT_IMPLEMENTED;
+    assert((futex = get_futex( &lock->Ptr )));
 
     old = *futex;
     if (0 == old) {
         new = SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT;
         if (interlocked_cmpxchg( futex, new, old ) == old)
-		return STATUS_SUCCESS;
+		return;
     }
 
     /* Atomically increment the exclusive waiter count. */
@@ -1886,54 +1863,27 @@ static NTSTATUS fast_acquire_srw_exclusive( RTL_SRWLOCK *lock )
         } while (interlocked_cmpxchg( futex, new, old ) != old);
 
         if (!wait)
-            return STATUS_SUCCESS;
+            return;
 
         futex_wait_bitset( futex, new, NULL, SRWLOCK_FUTEX_BITSET_EXCLUSIVE );
     }
 
-    return STATUS_SUCCESS;
+    return;
 }
 
-static NTSTATUS fast_try_acquire_srw_shared( RTL_SRWLOCK *lock )
-{
-    int new, old, *futex;
-
-    if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
-
-    if (!(futex = get_futex( &lock->Ptr )))
-        return STATUS_NOT_IMPLEMENTED;
-
-    do
-    {
-        old = *futex;
-
-        if (!(old & SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT)
-                && !(old & SRWLOCK_FUTEX_EXCLUSIVE_WAITERS_MASK))
-        {
-            /* Not locked exclusive, and no exclusive waiters. We can try to
-             * grab it. */
-            new = old + SRWLOCK_FUTEX_SHARED_OWNERS_INC;
-            assert(new & SRWLOCK_FUTEX_SHARED_OWNERS_MASK);
-        }
-        else
-        {
-            new = old;
-            return STATUS_TIMEOUT;
-        }
-    } while (interlocked_cmpxchg( futex, new, old ) != old);
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS fast_acquire_srw_shared( RTL_SRWLOCK *lock )
+/***********************************************************************
+ *              RtlAcquireSRWLockShared (NTDLL.@)
+ *
+ * NOTES
+ *   Do not call this function recursively - it will only succeed when
+ *   there are no threads waiting for an exclusive lock!
+ */
+void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
 {
     int old, new, *futex;
     BOOLEAN wait;
 
-    if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
-
-    if (!(futex = get_futex( &lock->Ptr )))
-        return STATUS_NOT_IMPLEMENTED;
+    assert((futex = get_futex( &lock->Ptr )));
 
     for (;;)
     {
@@ -1958,22 +1908,23 @@ static NTSTATUS fast_acquire_srw_shared( RTL_SRWLOCK *lock )
         } while (interlocked_cmpxchg( futex, new, old ) != old);
 
         if (!wait)
-            return STATUS_SUCCESS;
+            return;
 
         futex_wait_bitset( futex, new, NULL, SRWLOCK_FUTEX_BITSET_SHARED );
     }
 
-    return STATUS_SUCCESS;
+    return;
 }
 
-static NTSTATUS fast_release_srw_exclusive( RTL_SRWLOCK *lock )
+/***********************************************************************
+ *              RtlReleaseSRWLockExclusive (NTDLL.@)
+ */
+void WINAPI RtlReleaseSRWLockExclusive( RTL_SRWLOCK *lock )
+
 {
     int old, new, *futex;
 
-    if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
-
-    if (!(futex = get_futex( &lock->Ptr )))
-        return STATUS_NOT_IMPLEMENTED;
+    assert((futex = get_futex( &lock->Ptr )));
 
     do
     {
@@ -1982,7 +1933,7 @@ static NTSTATUS fast_release_srw_exclusive( RTL_SRWLOCK *lock )
         if (!(old & SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT))
         {
             ERR("Lock %p is not owned exclusive! (%#x)\n", lock, *futex);
-            return STATUS_RESOURCE_NOT_OWNED;
+            return;
         }
 
         new = old & ~SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT;
@@ -1996,17 +1947,17 @@ static NTSTATUS fast_release_srw_exclusive( RTL_SRWLOCK *lock )
     else if (old & SRWLOCK_FUTEX_SHARED_WAITERS_BIT)
         futex_wake_bitset( futex, INT_MAX, SRWLOCK_FUTEX_BITSET_SHARED );
 
-    return STATUS_SUCCESS;
+    return;
 }
 
-static NTSTATUS fast_release_srw_shared( RTL_SRWLOCK *lock )
+/***********************************************************************
+ *              RtlReleaseSRWLockShared (NTDLL.@)
+ */
+void WINAPI RtlReleaseSRWLockShared( RTL_SRWLOCK *lock )
 {
     int old, new, *futex;
 
-    if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
-
-    if (!(futex = get_futex( &lock->Ptr )))
-        return STATUS_NOT_IMPLEMENTED;
+    assert((futex = get_futex( &lock->Ptr )));
 
     do
     {
@@ -2015,12 +1966,12 @@ static NTSTATUS fast_release_srw_shared( RTL_SRWLOCK *lock )
         if (old & SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT)
         {
             ERR("Lock %p is owned exclusive! (%#x)\n", lock, *futex);
-            return STATUS_RESOURCE_NOT_OWNED;
+            return;
         }
         else if (!(old & SRWLOCK_FUTEX_SHARED_OWNERS_MASK))
         {
             ERR("Lock %p is not owned shared! (%#x)\n", lock, *futex);
-            return STATUS_RESOURCE_NOT_OWNED;
+            return;
         }
 
         new = old - SRWLOCK_FUTEX_SHARED_OWNERS_INC;
@@ -2029,258 +1980,6 @@ static NTSTATUS fast_release_srw_shared( RTL_SRWLOCK *lock )
     /* Optimization: only bother waking if there are actually exclusive waiters. */
     if (!(new & SRWLOCK_FUTEX_SHARED_OWNERS_MASK) && (new & SRWLOCK_FUTEX_EXCLUSIVE_WAITERS_MASK))
         futex_wake_bitset( futex, 1, SRWLOCK_FUTEX_BITSET_EXCLUSIVE );
-
-    return STATUS_SUCCESS;
-}
-
-#else
-
-static NTSTATUS fast_try_acquire_srw_exclusive( RTL_SRWLOCK *lock )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-static NTSTATUS fast_acquire_srw_exclusive( RTL_SRWLOCK *lock )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-static NTSTATUS fast_try_acquire_srw_shared( RTL_SRWLOCK *lock )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-static NTSTATUS fast_acquire_srw_shared( RTL_SRWLOCK *lock )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-static NTSTATUS fast_release_srw_exclusive( RTL_SRWLOCK *lock )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-static NTSTATUS fast_release_srw_shared( RTL_SRWLOCK *lock )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-#endif
-
-/* SRW locks implementation
- *
- * The memory layout used by the lock is:
- *
- * 32 31            16               0
- *  ________________ ________________
- * | X| #exclusive  |    #shared     |
- *  ¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯
- * Since there is no space left for a separate counter of shared access
- * threads inside the locked section the #shared field is used for multiple
- * purposes. The following table lists all possible states the lock can be
- * in, notation: [X, #exclusive, #shared]:
- *
- * [0,   0,   N] -> locked by N shared access threads, if N=0 it's unlocked
- * [0, >=1, >=1] -> threads are requesting exclusive locks, but there are
- * still shared access threads inside. #shared should not be incremented
- * anymore!
- * [1, >=1, >=0] -> lock is owned by an exclusive thread and the #shared
- * counter can be used again to count the number of threads waiting in the
- * queue for shared access.
- *
- * the following states are invalid and will never occur:
- * [0, >=1,   0], [1,   0, >=0]
- *
- * The main problem arising from the fact that we have no separate counter
- * of shared access threads inside the locked section is that in the state
- * [0, >=1, >=1] above we cannot add additional waiting threads to the
- * shared access queue - it wouldn't be possible to distinguish waiting
- * threads and those that are still inside. To solve this problem the lock
- * uses the following approach: a thread that isn't able to allocate a
- * shared lock just uses the exclusive queue instead. As soon as the thread
- * is woken up it is in the state [1, >=1, >=0]. In this state it's again
- * possible to use the shared access queue. The thread atomically moves
- * itself to the shared access queue and releases the exclusive lock, so
- * that the "real" exclusive access threads have a chance. As soon as they
- * are all ready the shared access threads are processed.
- */
-
-#define SRWLOCK_MASK_IN_EXCLUSIVE     0x80000000
-#define SRWLOCK_MASK_EXCLUSIVE_QUEUE  0x7fff0000
-#define SRWLOCK_MASK_SHARED_QUEUE     0x0000ffff
-#define SRWLOCK_RES_EXCLUSIVE         0x00010000
-#define SRWLOCK_RES_SHARED            0x00000001
-
-#ifdef WORDS_BIGENDIAN
-#define srwlock_key_exclusive(lock)   (&lock->Ptr)
-#define srwlock_key_shared(lock)      ((void *)((char *)&lock->Ptr + 2))
-#else
-#define srwlock_key_exclusive(lock)   ((void *)((char *)&lock->Ptr + 2))
-#define srwlock_key_shared(lock)      (&lock->Ptr)
-#endif
-
-static inline void srwlock_check_invalid( unsigned int val )
-{
-    /* Throw exception if it's impossible to acquire/release this lock. */
-    if ((val & SRWLOCK_MASK_EXCLUSIVE_QUEUE) == SRWLOCK_MASK_EXCLUSIVE_QUEUE ||
-            (val & SRWLOCK_MASK_SHARED_QUEUE) == SRWLOCK_MASK_SHARED_QUEUE)
-        RtlRaiseStatus(STATUS_RESOURCE_NOT_OWNED);
-}
-
-static inline unsigned int srwlock_lock_exclusive( unsigned int *dest, int incr )
-{
-    unsigned int val, tmp;
-    /* Atomically modifies the value of *dest by adding incr. If the shared
-     * queue is empty and there are threads waiting for exclusive access, then
-     * sets the mark SRWLOCK_MASK_IN_EXCLUSIVE to signal other threads that
-     * they are allowed again to use the shared queue counter. */
-    for (val = *dest;; val = tmp)
-    {
-        tmp = val + incr;
-        srwlock_check_invalid( tmp );
-        if ((tmp & SRWLOCK_MASK_EXCLUSIVE_QUEUE) && !(tmp & SRWLOCK_MASK_SHARED_QUEUE))
-            tmp |= SRWLOCK_MASK_IN_EXCLUSIVE;
-        if ((tmp = interlocked_cmpxchg( (int *)dest, tmp, val )) == val)
-            break;
-    }
-    return val;
-}
-
-static inline unsigned int srwlock_unlock_exclusive( unsigned int *dest, int incr )
-{
-    unsigned int val, tmp;
-    /* Atomically modifies the value of *dest by adding incr. If the queue of
-     * threads waiting for exclusive access is empty, then remove the
-     * SRWLOCK_MASK_IN_EXCLUSIVE flag (only the shared queue counter will
-     * remain). */
-    for (val = *dest;; val = tmp)
-    {
-        tmp = val + incr;
-        srwlock_check_invalid( tmp );
-        if (!(tmp & SRWLOCK_MASK_EXCLUSIVE_QUEUE))
-            tmp &= SRWLOCK_MASK_SHARED_QUEUE;
-        if ((tmp = interlocked_cmpxchg( (int *)dest, tmp, val )) == val)
-            break;
-    }
-    return val;
-}
-
-static inline void srwlock_leave_exclusive( RTL_SRWLOCK *lock, unsigned int val )
-{
-    /* Used when a thread leaves an exclusive section. If there are other
-     * exclusive access threads they are processed first, followed by
-     * the shared waiters. */
-    if (val & SRWLOCK_MASK_EXCLUSIVE_QUEUE)
-        NtReleaseKeyedEvent( 0, srwlock_key_exclusive(lock), FALSE, NULL );
-    else
-    {
-        val &= SRWLOCK_MASK_SHARED_QUEUE; /* remove SRWLOCK_MASK_IN_EXCLUSIVE */
-        while (val--)
-            NtReleaseKeyedEvent( 0, srwlock_key_shared(lock), FALSE, NULL );
-    }
-}
-
-static inline void srwlock_leave_shared( RTL_SRWLOCK *lock, unsigned int val )
-{
-    /* Wake up one exclusive thread as soon as the last shared access thread
-     * has left. */
-    if ((val & SRWLOCK_MASK_EXCLUSIVE_QUEUE) && !(val & SRWLOCK_MASK_SHARED_QUEUE))
-        NtReleaseKeyedEvent( 0, srwlock_key_exclusive(lock), FALSE, NULL );
-}
-
-/***********************************************************************
- *              RtlInitializeSRWLock (NTDLL.@)
- *
- * NOTES
- *  Please note that SRWLocks do not keep track of the owner of a lock.
- *  It doesn't make any difference which thread for example unlocks an
- *  SRWLock (see corresponding tests). This implementation uses two
- *  keyed events (one for the exclusive waiters and one for the shared
- *  waiters) and is limited to 2^15-1 waiting threads.
- */
-void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
-{
-    lock->Ptr = NULL;
-}
-
-/***********************************************************************
- *              RtlAcquireSRWLockExclusive (NTDLL.@)
- *
- * NOTES
- *  Unlike RtlAcquireResourceExclusive this function doesn't allow
- *  nested calls from the same thread. "Upgrading" a shared access lock
- *  to an exclusive access lock also doesn't seem to be supported.
- */
-void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
-{
-    if (fast_acquire_srw_exclusive( lock ) != STATUS_NOT_IMPLEMENTED)
-        return;
-
-    if (srwlock_lock_exclusive( (unsigned int *)&lock->Ptr, SRWLOCK_RES_EXCLUSIVE ))
-        NtWaitForKeyedEvent( 0, srwlock_key_exclusive(lock), FALSE, NULL );
-}
-
-/***********************************************************************
- *              RtlAcquireSRWLockShared (NTDLL.@)
- *
- * NOTES
- *   Do not call this function recursively - it will only succeed when
- *   there are no threads waiting for an exclusive lock!
- */
-void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
-{
-    unsigned int val, tmp;
-
-    if (fast_acquire_srw_shared( lock ) != STATUS_NOT_IMPLEMENTED)
-        return;
-
-    /* Acquires a shared lock. If it's currently not possible to add elements to
-     * the shared queue, then request exclusive access instead. */
-    for (val = *(unsigned int *)&lock->Ptr;; val = tmp)
-    {
-        if ((val & SRWLOCK_MASK_EXCLUSIVE_QUEUE) && !(val & SRWLOCK_MASK_IN_EXCLUSIVE))
-            tmp = val + SRWLOCK_RES_EXCLUSIVE;
-        else
-            tmp = val + SRWLOCK_RES_SHARED;
-        if ((tmp = interlocked_cmpxchg( (int *)&lock->Ptr, tmp, val )) == val)
-            break;
-    }
-
-    /* Drop exclusive access again and instead requeue for shared access. */
-    if ((val & SRWLOCK_MASK_EXCLUSIVE_QUEUE) && !(val & SRWLOCK_MASK_IN_EXCLUSIVE))
-    {
-        NtWaitForKeyedEvent( 0, srwlock_key_exclusive(lock), FALSE, NULL );
-        val = srwlock_unlock_exclusive( (unsigned int *)&lock->Ptr, (SRWLOCK_RES_SHARED
-                                        - SRWLOCK_RES_EXCLUSIVE) ) - SRWLOCK_RES_EXCLUSIVE;
-        srwlock_leave_exclusive( lock, val );
-    }
-
-    if (val & SRWLOCK_MASK_EXCLUSIVE_QUEUE)
-        NtWaitForKeyedEvent( 0, srwlock_key_shared(lock), FALSE, NULL );
-}
-
-/***********************************************************************
- *              RtlReleaseSRWLockExclusive (NTDLL.@)
- */
-void WINAPI RtlReleaseSRWLockExclusive( RTL_SRWLOCK *lock )
-{
-    if (fast_release_srw_exclusive( lock ) != STATUS_NOT_IMPLEMENTED)
-        return;
-
-    srwlock_leave_exclusive( lock, srwlock_unlock_exclusive( (unsigned int *)&lock->Ptr,
-                             - SRWLOCK_RES_EXCLUSIVE ) - SRWLOCK_RES_EXCLUSIVE );
-}
-
-/***********************************************************************
- *              RtlReleaseSRWLockShared (NTDLL.@)
- */
-void WINAPI RtlReleaseSRWLockShared( RTL_SRWLOCK *lock )
-{
-    if (fast_release_srw_shared( lock ) != STATUS_NOT_IMPLEMENTED)
-        return;
-
-    srwlock_leave_shared( lock, srwlock_lock_exclusive( (unsigned int *)&lock->Ptr,
-                          - SRWLOCK_RES_SHARED ) - SRWLOCK_RES_SHARED );
 }
 
 /***********************************************************************
@@ -2292,13 +1991,21 @@ void WINAPI RtlReleaseSRWLockShared( RTL_SRWLOCK *lock )
  */
 BOOLEAN WINAPI RtlTryAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 {
-    NTSTATUS ret;
+    int old, new, *futex;
 
-    if ((ret = fast_try_acquire_srw_exclusive( lock )) != STATUS_NOT_IMPLEMENTED)
-        return (ret == STATUS_SUCCESS);
+    assert((futex = get_futex( &lock->Ptr )));
 
-    return interlocked_cmpxchg( (int *)&lock->Ptr, SRWLOCK_MASK_IN_EXCLUSIVE |
-                                SRWLOCK_RES_EXCLUSIVE, 0 ) == 0;
+    old = *futex;
+
+    /* We can only lock when no bits are set */
+    if (0 == old)
+    {
+        new = SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT;
+        if (interlocked_cmpxchg( futex, new, old ) == old)
+            return TRUE;
+    }
+
+    return FALSE;
 }
 
 /***********************************************************************
@@ -2306,23 +2013,33 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
  */
 BOOLEAN WINAPI RtlTryAcquireSRWLockShared( RTL_SRWLOCK *lock )
 {
-    unsigned int val, tmp;
-    NTSTATUS ret;
+    int new, old, *futex;
 
-    if ((ret = fast_try_acquire_srw_shared( lock )) != STATUS_NOT_IMPLEMENTED)
-        return (ret == STATUS_SUCCESS);
 
-    for (val = *(unsigned int *)&lock->Ptr;; val = tmp)
+    assert((futex = get_futex( &lock->Ptr )));
+
+    do
     {
-        if (val & SRWLOCK_MASK_EXCLUSIVE_QUEUE)
+        old = *futex;
+
+        if (!(old & SRWLOCK_FUTEX_EXCLUSIVE_LOCK_BIT)
+                && !(old & SRWLOCK_FUTEX_EXCLUSIVE_WAITERS_MASK))
+        {
+            /* Not locked exclusive, and no exclusive waiters. We can try to
+             * grab it. */
+            new = old + SRWLOCK_FUTEX_SHARED_OWNERS_INC;
+            assert(new & SRWLOCK_FUTEX_SHARED_OWNERS_MASK);
+        }
+        else
+        {
+            new = old;
             return FALSE;
-        if ((tmp = interlocked_cmpxchg( (int *)&lock->Ptr, val + SRWLOCK_RES_SHARED, val )) == val)
-            break;
-    }
+        }
+    } while (interlocked_cmpxchg( futex, new, old ) != old);
+
     return TRUE;
 }
 
-#ifdef __linux__
 static NTSTATUS fast_wait_cv( int *futex, int val, const LARGE_INTEGER *timeout )
 {
     struct timespec timespec;
@@ -2340,91 +2057,6 @@ static NTSTATUS fast_wait_cv( int *futex, int val, const LARGE_INTEGER *timeout 
         return STATUS_TIMEOUT;
     return STATUS_WAIT_0;
 }
-
-static NTSTATUS fast_sleep_cs_cv( RTL_CONDITION_VARIABLE *variable,
-        RTL_CRITICAL_SECTION *cs, const LARGE_INTEGER *timeout )
-{
-    NTSTATUS status;
-    int val, *futex;
-
-    if (!use_futexes())
-        return STATUS_NOT_IMPLEMENTED;
-
-    if (!(futex = get_futex( &variable->Ptr )))
-        return STATUS_NOT_IMPLEMENTED;
-
-    val = *futex;
-
-    RtlLeaveCriticalSection( cs );
-    status = fast_wait_cv( futex, val, timeout );
-    RtlEnterCriticalSection( cs );
-    return status;
-}
-
-static NTSTATUS fast_sleep_srw_cv( RTL_CONDITION_VARIABLE *variable,
-        RTL_SRWLOCK *lock, const LARGE_INTEGER *timeout, ULONG flags )
-{
-    NTSTATUS status;
-    int val, *futex;
-
-    if (!use_futexes())
-        return STATUS_NOT_IMPLEMENTED;
-
-    if (!(futex = get_futex( &variable->Ptr )))
-        return STATUS_NOT_IMPLEMENTED;
-
-    val = *futex;
-
-    if (flags & RTL_CONDITION_VARIABLE_LOCKMODE_SHARED)
-        RtlReleaseSRWLockShared( lock );
-    else
-        RtlReleaseSRWLockExclusive( lock );
-
-    status = fast_wait_cv( futex, val, timeout );
-
-    if (flags & RTL_CONDITION_VARIABLE_LOCKMODE_SHARED)
-        RtlAcquireSRWLockShared( lock );
-    else
-        RtlAcquireSRWLockExclusive( lock );
-    return status;
-}
-
-static NTSTATUS fast_wake_cv( RTL_CONDITION_VARIABLE *variable, int count )
-{
-    int *futex;
-
-    if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
-
-    if (!(futex = get_futex( &variable->Ptr )))
-        return STATUS_NOT_IMPLEMENTED;
-
-    interlocked_xchg_add( futex, 1 );
-    futex_wake( futex, count );
-    return STATUS_SUCCESS;
-}
-#else
-static NTSTATUS fast_sleep_srw_cv( RTL_CONDITION_VARIABLE *variable,
-        RTL_SRWLOCK *lock, const LARGE_INTEGER *timeout, ULONG flags )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-static NTSTATUS fast_sleep_cs_cv( RTL_CONDITION_VARIABLE *variable,
-        RTL_CRITICAL_SECTION *cs, const LARGE_INTEGER *timeout )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-static NTSTATUS fast_wait_cv( RTL_CONDITION_VARIABLE *variable, int val, const LARGE_INTEGER *timeout )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-static NTSTATUS fast_wake_cv( RTL_CONDITION_VARIABLE *variable, int count )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-#endif
 
 /***********************************************************************
  *           RtlInitializeConditionVariable   (NTDLL.@)
@@ -2459,11 +2091,12 @@ void WINAPI RtlInitializeConditionVariable( RTL_CONDITION_VARIABLE *variable )
  */
 void WINAPI RtlWakeConditionVariable( RTL_CONDITION_VARIABLE *variable )
 {
-    if (fast_wake_cv( variable, 1 ) == STATUS_NOT_IMPLEMENTED)
-    {
-        interlocked_xchg_add( (int *)&variable->Ptr, 1 );
-        RtlWakeAddressSingle( variable );
-    }
+    int *futex;
+
+    assert((futex = get_futex( &variable->Ptr )));
+
+    interlocked_xchg_add( futex, 1 );
+    futex_wake( futex, 1 );
 }
 
 /***********************************************************************
@@ -2473,11 +2106,12 @@ void WINAPI RtlWakeConditionVariable( RTL_CONDITION_VARIABLE *variable )
  */
 void WINAPI RtlWakeAllConditionVariable( RTL_CONDITION_VARIABLE *variable )
 {
-    if (fast_wake_cv( variable, INT_MAX ) == STATUS_NOT_IMPLEMENTED)
-    {
-        interlocked_xchg_add( (int *)&variable->Ptr, 1 );
-        RtlWakeAddressAll( variable );
-    }
+    int *futex;
+
+    assert((futex = get_futex( &variable->Ptr )));
+
+    interlocked_xchg_add( futex, 1 );
+    futex_wake( futex, INT_MAX );
 }
 
 /***********************************************************************
@@ -2499,14 +2133,14 @@ NTSTATUS WINAPI RtlSleepConditionVariableCS( RTL_CONDITION_VARIABLE *variable, R
                                              const LARGE_INTEGER *timeout )
 {
     NTSTATUS status;
-    int val;
+    int val, *futex;
 
-    if ((status = fast_sleep_cs_cv( variable, crit, timeout )) != STATUS_NOT_IMPLEMENTED)
-        return status;
+    assert((futex = get_futex( &variable->Ptr )));
 
-    val = *(int *)&variable->Ptr;
+    val = *futex;
+
     RtlLeaveCriticalSection( crit );
-    status = RtlWaitOnAddress( &variable->Ptr, &val, sizeof(int), timeout );
+    status = fast_wait_cv( futex, val, timeout );
     RtlEnterCriticalSection( crit );
     return status;
 }
@@ -2534,19 +2168,18 @@ NTSTATUS WINAPI RtlSleepConditionVariableSRW( RTL_CONDITION_VARIABLE *variable, 
                                               const LARGE_INTEGER *timeout, ULONG flags )
 {
     NTSTATUS status;
-    int val;
+    int val, *futex;
 
-    if ((status = fast_sleep_srw_cv( variable, lock, timeout, flags )) != STATUS_NOT_IMPLEMENTED)
-        return status;
+    assert((futex = get_futex( &variable->Ptr )));
 
-    val = *(int *)&variable->Ptr;
+    val = *futex;
 
     if (flags & RTL_CONDITION_VARIABLE_LOCKMODE_SHARED)
         RtlReleaseSRWLockShared( lock );
     else
         RtlReleaseSRWLockExclusive( lock );
 
-    status = RtlWaitOnAddress( &variable->Ptr, &val, sizeof(int), timeout );
+    status = fast_wait_cv( futex, val, timeout );
 
     if (flags & RTL_CONDITION_VARIABLE_LOCKMODE_SHARED)
         RtlAcquireSRWLockShared( lock );
@@ -2581,7 +2214,6 @@ static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size )
     return FALSE;
 }
 
-#ifdef __linux__
 /* We can't map addresses to futex directly, because an application can wait on
  * 8 bytes, and we can't pass all 8 as the compare value to futex(). Instead we
  * map all addresses to a small fixed table of futexes. This may result in
@@ -2596,16 +2228,19 @@ static inline int *hash_addr( const void *addr )
     return &addr_futex_table[(val >> 2) & 255];
 }
 
-static inline NTSTATUS fast_wait_addr( const void *addr, const void *cmp, SIZE_T size,
-                                       const LARGE_INTEGER *timeout )
+/***********************************************************************
+ *           RtlWaitOnAddress   (NTDLL.@)
+ */
+NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size,
+                                  const LARGE_INTEGER *timeout )
 {
     int *futex;
     int val;
     struct timespec timespec;
     int ret;
 
-    if (!use_futexes())
-        return STATUS_NOT_IMPLEMENTED;
+    if (size != 1 && size != 2 && size != 4 && size != 8)
+        return STATUS_INVALID_PARAMETER;
 
     futex = hash_addr( addr );
 
@@ -2631,125 +2266,18 @@ static inline NTSTATUS fast_wait_addr( const void *addr, const void *cmp, SIZE_T
     return STATUS_SUCCESS;
 }
 
-static inline NTSTATUS fast_wake_addr( const void *addr )
+/***********************************************************************
+ *           RtlWakeAddressAll    (NTDLL.@)
+ */
+void WINAPI RtlWakeAddressAll( const void *addr )
 {
     int *futex;
-
-    if (!use_futexes())
-        return STATUS_NOT_IMPLEMENTED;
 
     futex = hash_addr( addr );
 
     interlocked_xchg_add( futex, 1 );
 
     futex_wake( futex, INT_MAX );
-    return STATUS_SUCCESS;
-}
-#else
-static inline NTSTATUS fast_wait_addr( const void *addr, const void *cmp, SIZE_T size,
-                                       const LARGE_INTEGER *timeout )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-static inline NTSTATUS fast_wake_addr( const void *addr )
-{
-    return STATUS_NOT_IMPLEMENTED;
-}
-#endif
-
-/***********************************************************************
- *           RtlWaitOnAddress   (NTDLL.@)
- */
-NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size,
-                                  const LARGE_INTEGER *timeout )
-{
-    select_op_t select_op;
-    NTSTATUS ret;
-    int cookie;
-    BOOL user_apc = FALSE;
-    obj_handle_t apc_handle = 0;
-    apc_call_t call;
-    apc_result_t result;
-    timeout_t abs_timeout = timeout ? timeout->QuadPart : TIMEOUT_INFINITE;
-    sigset_t old_set;
-
-    if (size != 1 && size != 2 && size != 4 && size != 8)
-        return STATUS_INVALID_PARAMETER;
-
-    if ((ret = fast_wait_addr( addr, cmp, size, timeout )) != STATUS_NOT_IMPLEMENTED)
-        return ret;
-
-    select_op.keyed_event.op     = SELECT_KEYED_EVENT_WAIT;
-    select_op.keyed_event.handle = wine_server_obj_handle( keyed_event );
-    select_op.keyed_event.key    = wine_server_client_ptr( addr );
-
-    memset( &result, 0, sizeof(result) );
-
-    do
-    {
-        RtlEnterCriticalSection( &addr_section );
-        if (!compare_addr( addr, cmp, size ))
-        {
-            RtlLeaveCriticalSection( &addr_section );
-            return STATUS_SUCCESS;
-        }
-
-        pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
-        for (;;)
-        {
-            SERVER_START_REQ( select )
-            {
-                req->flags    = SELECT_INTERRUPTIBLE;
-                req->cookie   = wine_server_client_ptr( &cookie );
-                req->prev_apc = apc_handle;
-                req->timeout  = abs_timeout;
-                wine_server_add_data( req, &result, sizeof(result) );
-                wine_server_add_data( req, &select_op, sizeof(select_op.keyed_event) );
-                ret = server_call_unlocked( req );
-                abs_timeout = reply->timeout;
-                apc_handle  = reply->apc_handle;
-                call        = reply->call;
-            }
-            SERVER_END_REQ;
-
-            if (ret != STATUS_KERNEL_APC) break;
-            invoke_apc( &call, &result );
-        }
-        pthread_sigmask( SIG_SETMASK, &old_set, NULL );
-
-        RtlLeaveCriticalSection( &addr_section );
-
-        if (ret == STATUS_USER_APC)
-        {
-            invoke_apc( &call, &result );
-            /* if we ran a user apc we have to check once more if additional apcs are queued,
-             * but we don't want to wait */
-            abs_timeout = 0;
-            user_apc = TRUE;
-            size = 0;
-        }
-
-        if (ret == STATUS_PENDING) ret = wait_select_reply( &cookie );
-    }
-    while (ret == STATUS_USER_APC || ret == STATUS_KERNEL_APC);
-
-    if (ret == STATUS_TIMEOUT && user_apc) ret = STATUS_USER_APC;
-
-    return ret;
-}
-
-/***********************************************************************
- *           RtlWakeAddressAll    (NTDLL.@)
- */
-void WINAPI RtlWakeAddressAll( const void *addr )
-{
-    if (fast_wake_addr( addr ) != STATUS_NOT_IMPLEMENTED)
-        return;
-
-    RtlEnterCriticalSection( &addr_section );
-    while (NtReleaseKeyedEvent( 0, addr, 0, &zero_timeout ) == STATUS_SUCCESS) {}
-    RtlLeaveCriticalSection( &addr_section );
 }
 
 /***********************************************************************
@@ -2757,10 +2285,11 @@ void WINAPI RtlWakeAddressAll( const void *addr )
  */
 void WINAPI RtlWakeAddressSingle( const void *addr )
 {
-    if (fast_wake_addr( addr ) != STATUS_NOT_IMPLEMENTED)
-        return;
+    int *futex;
 
-    RtlEnterCriticalSection( &addr_section );
-    NtReleaseKeyedEvent( 0, addr, 0, &zero_timeout );
-    RtlLeaveCriticalSection( &addr_section );
+    futex = hash_addr( addr );
+
+    interlocked_xchg_add( futex, 1 );
+
+    futex_wake( futex, 1 );
 }
